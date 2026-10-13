@@ -3,7 +3,7 @@
 // host-service event loop. Credential env is resolved in-process (it needs
 // the credential provider) and crosses as plain data.
 
-import { existsSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
 	getGitAuthorName,
@@ -12,6 +12,7 @@ import {
 } from "../../runtime/git/identity.ts";
 import { resolveRef } from "../../runtime/git/refs.ts";
 import { createUserSimpleGit } from "../../runtime/git/simple-git.ts";
+import { isMissingPath } from "../../runtime/path-state/index.ts";
 import {
 	readWorkspaceRefs,
 	type WorkspaceRefsSnapshot,
@@ -621,7 +622,39 @@ export type RestoreWorktreeResult =
 	| { kind: "already-registered" }
 	| { kind: "registered-elsewhere"; path: string }
 	| { kind: "path-occupied" }
-	| { kind: "branch-missing" };
+	| { kind: "branch-missing" }
+	| { kind: "fetch-failed" };
+
+const RESTORE_FETCH_TIMEOUT_MS = 15_000;
+
+async function fetchRemoteBranch(args: {
+	repoPath: string;
+	remoteName: string;
+	branch: string;
+	gitEnv: GitTaskEnv;
+}): Promise<"looked" | "unreachable"> {
+	const { repoPath, remoteName, branch, gitEnv } = args;
+	const git = createUserSimpleGit(repoPath, {
+		env: gitEnv,
+		timeout: { block: RESTORE_FETCH_TIMEOUT_MS },
+	});
+	const remotes = await git.getRemotes();
+	if (!remotes.some((remote) => remote.name === remoteName)) return "looked";
+	try {
+		await git.fetch([
+			remoteName,
+			`refs/heads/${branch}:refs/remotes/${remoteName}/${branch}`,
+			"--quiet",
+			"--no-tags",
+		]);
+		return "looked";
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		if (message.includes("couldn't find remote ref")) return "looked";
+		console.warn(`[git/restoreWorktree] fetch ${branch} failed:`, err);
+		return "unreachable";
+	}
+}
 
 /** Re-create an archived workspace's worktree on its existing branch. */
 export const gitRestoreWorktreeTask = defineWorkerTask<
@@ -659,9 +692,19 @@ export const gitRestoreWorktreeTask = defineWorkerTask<
 				? { kind: "already-registered" }
 				: { kind: "registered-elsewhere", path: registeredPath };
 		}
-		if (existsSync(worktreePath)) return { kind: "path-occupied" };
+		if (!isMissingPath(worktreePath)) return { kind: "path-occupied" };
 
-		const ref = await resolveRef(git, branch, { remote: remoteName });
+		let ref = await resolveRef(git, branch, { remote: remoteName });
+		if (ref?.kind !== "local" && ref?.kind !== "remote-tracking") {
+			const fetched = await fetchRemoteBranch({
+				repoPath,
+				remoteName,
+				branch,
+				gitEnv,
+			});
+			if (fetched === "unreachable") return { kind: "fetch-failed" };
+			ref = await resolveRef(git, branch, { remote: remoteName });
+		}
 		if (ref?.kind !== "local" && ref?.kind !== "remote-tracking") {
 			return { kind: "branch-missing" };
 		}

@@ -1,7 +1,9 @@
 import { Trans, useLingui } from "@lingui/react/macro";
+import { acpHarnessForPreset } from "@superset/chat/core";
 import { AGENT_DEFAULT_MODE, type UserContent } from "@superset/chat/protocol";
 import { getAgentModelSupport } from "@superset/shared/agent-models";
 import { buildChatSessionHandoffPrompt } from "@superset/shared/terminal-session-handoff";
+import { alert } from "@superset/ui/atoms/Alert";
 import { toast } from "@superset/ui/sonner";
 import { useWorkspaceClient } from "@superset/workspace-client";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -11,10 +13,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTerminalAgentBindings } from "renderer/hooks/host-service/useTerminalAgentBindings";
 import { useWorkspaceEvent } from "renderer/hooks/host-service/useWorkspaceEvent";
 import { useV2AgentConfigs } from "renderer/hooks/useV2AgentConfigs";
-import { acpHarnessForPreset } from "renderer/lib/acpHarness";
 import type { OpenFile } from "../../../../../../types";
 import { SessionView } from "../../../ChatSession/components/SessionView";
 import { useSessionClient } from "../../../ChatSession/hooks/useSessionClient";
+import type {
+	OpenLink,
+	OpenPage,
+} from "../../../ChatSession/providers/ChatPaneActionsProvider";
 import type { ChatForkTarget } from "../../../ChatSession/types";
 import { isUnrestrictedMode } from "../../../ChatSession/utils/isUnrestrictedMode";
 import { useForkChat } from "../../hooks/useForkChat";
@@ -35,6 +40,14 @@ import {
 const MAX_RECOVERIES = 3;
 const REPLACEMENT_TIMEOUT_MS = 30_000;
 
+export interface AgentSwitchTarget {
+	presetId: string;
+	label: string;
+	model: { id: string; label: string } | null;
+	modeId: string | undefined;
+	handoffPrompt: string | null;
+}
+
 export function AcpChatPane({
 	agent,
 	isActive,
@@ -42,9 +55,12 @@ export function AcpChatPane({
 	onPendingPromptsSent,
 	onQueuePrompt,
 	onOpenFile,
+	onOpenPage,
+	onOpenLink,
 	onModeChange,
 	onSessionCreated,
 	onSwitchAgent,
+	onForkAgent,
 	pendingPrompts,
 	sessionId,
 	terminalId,
@@ -66,13 +82,10 @@ export function AcpChatPane({
 	onModeChange?: (modeId: string) => void;
 	onSessionInfo: (info: { harnessSessionId?: string; title?: string }) => void;
 	onOpenFile?: OpenFile;
-	onSwitchAgent?: (target: {
-		presetId: string;
-		label: string;
-		model: { id: string; label: string } | null;
-		modeId: string | undefined;
-		handoffPrompt: string | null;
-	}) => void;
+	onOpenPage?: OpenPage;
+	onOpenLink?: OpenLink;
+	onSwitchAgent?: (target: AgentSwitchTarget) => void;
+	onForkAgent?: (target: AgentSwitchTarget & { handoffPrompt: string }) => void;
 	modelId?: string;
 	modelLabel?: string;
 	modeId?: string;
@@ -188,7 +201,10 @@ export function AcpChatPane({
 		],
 	);
 
-	const agentSessionId = agent?.sessionId;
+	// A pane adopted in the background never saw the stream report the agent
+	// session, so recovery takes it from the host's row instead.
+	const agentSessionId =
+		agent?.sessionId ?? stored?.session?.harnessSessionId ?? undefined;
 	// Resuming when there is a session to resume, and a plain new one when the
 	// pane was opened straight onto the chat and no agent has run yet.
 	useEffect(() => {
@@ -287,21 +303,15 @@ export function AcpChatPane({
 				transcript: string,
 				currentModeId: string | undefined,
 			) => {
-				if (sessionId) {
-					try {
-						await wiring.transport.closeSession({ sessionId });
-					} catch (error) {
-						console.warn("[acp-chat] could not stop the chat session", error);
-						toast.error(t({ message: "Couldn't stop the chat" }));
-						return;
-					}
-				}
-				if (!mounted.current) return;
-				onSwitchAgent({
+				const label =
+					agentConfigs?.find((config) => config.presetId === presetId)?.label ??
+					presetId;
+				const currentLabel =
+					agentConfigs?.find((config) => config.presetId === agent.id)?.label ??
+					agent.id;
+				const target: AgentSwitchTarget = {
 					presetId,
-					label:
-						agentConfigs?.find((config) => config.presetId === presetId)
-							?.label ?? presetId,
+					label,
 					model: nextModel,
 					// Never more access than the chat being left, unless the user
 					// already chose otherwise for the agent being switched to.
@@ -313,15 +323,50 @@ export function AcpChatPane({
 					handoffPrompt: transcript.trim()
 						? buildChatSessionHandoffPrompt({
 								transcript,
-								sourceAgentLabel: agentConfigs?.find(
-									(config) => config.presetId === agent.id,
-								)?.label,
+								sourceAgentLabel: currentLabel,
 							})
 						: null,
-				});
+				};
+				const { handoffPrompt } = target;
+				if (handoffPrompt && onForkAgent) {
+					alert({
+						title: t({ message: `Continue in a new ${label} chat?` }),
+						description: t({
+							message: `A chat can't switch to another provider partway through. Fork this conversation into a new ${label} chat instead. This ${currentLabel} chat stays open.`,
+						}),
+						actions: [
+							{
+								label: t({ message: "Fork to new chat" }),
+								variant: "default",
+								onClick: () => onForkAgent({ ...target, handoffPrompt }),
+							},
+							{ label: t({ message: "Cancel" }), variant: "ghost" },
+						],
+					});
+					return;
+				}
+				if (sessionId) {
+					try {
+						await wiring.transport.closeSession({ sessionId });
+					} catch (error) {
+						console.warn("[acp-chat] could not stop the chat session", error);
+						toast.error(t({ message: "Couldn't stop the chat" }));
+						return;
+					}
+				}
+				if (!mounted.current) return;
+				onSwitchAgent(target);
 			},
 		};
-	}, [agent, agentConfigs, onSwitchAgent, sessionId, t, wiring.transport]);
+	}, [
+		agent,
+		agentConfigs,
+		onSwitchAgent,
+		onForkAgent,
+		sessionId,
+		t,
+		wiring.transport,
+	]);
 
 	const sessionDead = stored?.session?.status === "dead";
 	const sessionStopped =
@@ -406,9 +451,10 @@ export function AcpChatPane({
 		recover();
 	}, [recover]);
 
+	const draftKey = `chat-v3-draft:${terminalId}`;
 	const draft = (notice: ReactNode) => (
 		<DraftChat
-			draftKey={`chat-v3-draft:${terminalId}`}
+			draftKey={draftKey}
 			isActive={isActive}
 			notice={
 				unreachable ? <Trans>Connecting to the host service…</Trans> : notice
@@ -459,6 +505,7 @@ export function AcpChatPane({
 	return (
 		<SessionView
 			client={client}
+			draftKey={draftKey}
 			{...(recovering
 				? {
 						held: {
@@ -481,6 +528,8 @@ export function AcpChatPane({
 			isActive={isActive}
 			onFork={fork}
 			openFile={onOpenFile}
+			openPage={onOpenPage}
+			openLink={onOpenLink}
 			onSessionState={(state) => {
 				// A resume that found no transcript lands on a different agent
 				// session. Keep the pane pointed at the live one, or the trip back
@@ -496,7 +545,6 @@ export function AcpChatPane({
 			}}
 			pendingPrompts={pendingPrompts}
 			preferredModelLabel={modelLabel}
-			sessionId={sessionId}
 			workspaceId={workspaceId}
 		/>
 	);
